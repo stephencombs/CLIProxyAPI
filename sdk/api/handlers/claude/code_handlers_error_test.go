@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -284,6 +285,66 @@ func TestWriteClaudeErrorResponse_IncludesRetryAfterForModelCooldownDefaultSetti
 	}
 	if got := recorder.Header().Get("Retry-After"); got != "20" {
 		t.Fatalf("Retry-After = %q, want 20", got)
+	}
+	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Status"); got != "rejected" {
+		t.Fatalf("unified status = %q, want rejected", got)
+	}
+	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Representative-Claim"); got != "five_hour" {
+		t.Fatalf("representative claim = %q, want five_hour", got)
+	}
+	resetAt, err := strconv.ParseInt(recorder.Header().Get("Anthropic-Ratelimit-Unified-Reset"), 10, 64)
+	if err != nil {
+		t.Fatalf("unified reset = %q", recorder.Header().Get("Anthropic-Ratelimit-Unified-Reset"))
+	}
+	wantReset := time.Now().Add(20 * time.Second).Unix()
+	if resetAt < wantReset-5 || resetAt > wantReset+5 {
+		t.Fatalf("unified reset = %d, want about %d", resetAt, wantReset)
+	}
+}
+
+func TestWriteClaudeErrorResponse_WeeklyCooldownUsesSevenDayClaim(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      coreauth.NewModelCooldownError("claude-opus-4-6", "claude", 26*time.Hour),
+	}
+
+	handler.WriteErrorResponse(c, msg)
+
+	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Representative-Claim"); got != "seven_day" {
+		t.Fatalf("representative claim = %q, want seven_day", got)
+	}
+}
+
+func TestWriteClaudeErrorResponse_KeepsUpstreamUnifiedReset(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      coreauth.NewModelCooldownError("claude-sonnet-4-6", "claude", 20*time.Second),
+		Addon: http.Header{
+			"Anthropic-Ratelimit-Unified-Status":               {"rejected"},
+			"Anthropic-Ratelimit-Unified-Reset":                {"1794146400"},
+			"Anthropic-Ratelimit-Unified-Representative-Claim": {"seven_day"},
+			"X-Request-Id": {"req-1"},
+		},
+	}
+
+	handler.WriteErrorResponse(c, msg)
+
+	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Reset"); got != "1794146400" {
+		t.Fatalf("unified reset = %q, want upstream value", got)
+	}
+	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Representative-Claim"); got != "seven_day" {
+		t.Fatalf("representative claim = %q, want seven_day", got)
+	}
+	if got := recorder.Header().Get("X-Request-Id"); got != "" {
+		t.Fatalf("X-Request-Id = %q, want it to stay hidden", got)
 	}
 }
 

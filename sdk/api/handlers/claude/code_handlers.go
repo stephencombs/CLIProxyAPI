@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -582,6 +583,52 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 	return response
 }
 
+const claudeFiveHourWindowSeconds = 5 * 60 * 60
+
+// copyClaudeUnifiedRateLimitHeaders forwards Anthropic's unified rate-limit
+// headers even when general header passthrough is disabled. Other addon
+// headers stay behind that setting.
+func copyClaudeUnifiedRateLimitHeaders(dst http.Header, msg *interfaces.ErrorMessage) {
+	if dst == nil || msg == nil || msg.Addon == nil {
+		return
+	}
+	for key, values := range msg.Addon {
+		if len(values) == 0 || !strings.HasPrefix(strings.ToLower(key), "anthropic-ratelimit-unified-") {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			if strings.TrimSpace(value) == "" {
+				continue
+			}
+			dst.Add(key, value)
+		}
+	}
+}
+
+// applyClaudeClientRateLimitHeaders gives Claude Code the status, claim, and
+// absolute reset it turns into rate_limit_info.resetsAt. A cooldown response
+// often has only Retry-After. A reset already supplied by upstream is kept.
+func applyClaudeClientRateLimitHeaders(header http.Header, status int, now time.Time) {
+	if header == nil || status != http.StatusTooManyRequests {
+		return
+	}
+	if strings.TrimSpace(header.Get("Anthropic-Ratelimit-Unified-Status")) != "" {
+		return
+	}
+	seconds, err := strconv.Atoi(strings.TrimSpace(header.Get("Retry-After")))
+	if err != nil || seconds <= 0 {
+		return
+	}
+	claim := "five_hour"
+	if seconds > claudeFiveHourWindowSeconds {
+		claim = "seven_day"
+	}
+	header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+	header.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(now.Add(time.Duration(seconds)*time.Second).Unix(), 10))
+	header.Set("Anthropic-Ratelimit-Unified-Representative-Claim", claim)
+}
+
 func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
@@ -610,6 +657,7 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 		if !c.Writer.Written() && c.Writer.Header().Get("Content-Type") == "" {
 			c.Writer.Header().Set("Content-Type", "application/json")
 		}
+		applyClaudeClientRateLimitHeaders(c.Writer.Header(), status, time.Now())
 		c.Status(status)
 		_, _ = c.Writer.Write(body)
 		return
@@ -619,6 +667,10 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 			c.Writer.Header().Add("Retry-After", value)
 		}
 	}
+	// Claude Code ignores a gateway 429 unless these headers are present, and
+	// T3 reads resetsAt from the rate_limit_event they produce. Passthrough is
+	// off by default, so copy only the unified rate-limit headers.
+	copyClaudeUnifiedRateLimitHeaders(c.Writer.Header(), msg)
 	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.CurrentConfig()) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 || handlers.IsCPAReservedResponseHeader(key) {
@@ -635,6 +687,8 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 			}
 		}
 	}
+
+	applyClaudeClientRateLimitHeaders(c.Writer.Header(), status, time.Now())
 
 	body, err := json.Marshal(h.toClaudeError(msg))
 	if err != nil {
