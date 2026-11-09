@@ -629,6 +629,67 @@ func applyClaudeClientRateLimitHeaders(header http.Header, status int, now time.
 	header.Set("Anthropic-Ratelimit-Unified-Representative-Claim", claim)
 }
 
+// claudeRateLimitSeconds is how long the client should wait. A future unified
+// reset wins over Retry-After, which can include the proxy's cooldown fuzz.
+func claudeRateLimitSeconds(header http.Header, now time.Time) int {
+	if header == nil {
+		return 0
+	}
+	if resetRaw := strings.TrimSpace(header.Get("Anthropic-Ratelimit-Unified-Reset")); resetRaw != "" {
+		if resetAt, err := strconv.ParseInt(resetRaw, 10, 64); err == nil {
+			seconds := int(resetAt - now.Unix())
+			if seconds > 0 {
+				return seconds
+			}
+		}
+	}
+	seconds, err := strconv.Atoi(strings.TrimSpace(header.Get("Retry-After")))
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	return seconds
+}
+
+func claudeUsageLimitResetPhrase(seconds int) string {
+	if seconds < 1 {
+		seconds = 1
+	}
+	hours := seconds / 3600
+	minutes := (seconds % 3600) / 60
+	secs := seconds % 60
+	parts := make([]string, 0, 3)
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if minutes > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", minutes))
+	}
+	if secs > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", secs))
+	}
+	return strings.Join(parts, " ")
+}
+
+// claudeT3ResetMessage is the text Claude Code keeps inside "API Error: 503 …".
+// T3 only schedules auto-resume when that text contains this reset-after clause.
+func claudeT3ResetMessage(seconds int) string {
+	return fmt.Sprintf(`[cli-proxy] [429]: {"type":"error","error":{"type":"rate_limit_error","message":"account rate limit"}} (reset after %s)`, claudeUsageLimitResetPhrase(seconds))
+}
+
+func claudeT3ResetBody(seconds int) []byte {
+	body, err := json.Marshal(claudeErrorResponse{
+		Type: "error",
+		Error: claudeErrorDetail{
+			Type:    "rate_limit_error",
+			Message: claudeT3ResetMessage(seconds),
+		},
+	})
+	if err != nil {
+		return []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"account rate limit"}}`)
+	}
+	return body
+}
+
 func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
@@ -658,6 +719,7 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 			c.Writer.Header().Set("Content-Type", "application/json")
 		}
 		applyClaudeClientRateLimitHeaders(c.Writer.Header(), status, time.Now())
+		status, body = finishClaudeRateLimitResponse(c.Writer.Header(), status, body, time.Now())
 		c.Status(status)
 		_, _ = c.Writer.Write(body)
 		return
@@ -698,8 +760,26 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	if !c.Writer.Written() {
 		c.Writer.Header().Set("Content-Type", "application/json")
 	}
+	status, body = finishClaudeRateLimitResponse(c.Writer.Header(), status, body, time.Now())
 	c.Status(status)
 	_, _ = c.Writer.Write(body)
+}
+
+func finishClaudeRateLimitResponse(header http.Header, status int, body []byte, now time.Time) (int, []byte) {
+	if status != http.StatusTooManyRequests {
+		return status, body
+	}
+	seconds := claudeRateLimitSeconds(header, now)
+	if seconds <= 0 {
+		return status, body
+	}
+	if header != nil {
+		header.Set("x-should-retry", "false")
+	}
+	// Claude Code, signed in with an API key, drops rate-limit headers and
+	// reports a bare 429. T3 reads the reset only from a 503 result whose
+	// text contains "reset after".
+	return http.StatusServiceUnavailable, claudeT3ResetBody(seconds)
 }
 
 func claudeErrorText(err error) string {

@@ -280,11 +280,17 @@ func TestWriteClaudeErrorResponse_IncludesRetryAfterForModelCooldownDefaultSetti
 
 	handler.WriteErrorResponse(c, msg)
 
-	if recorder.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
 	if got := recorder.Header().Get("Retry-After"); got != "20" {
 		t.Fatalf("Retry-After = %q, want 20", got)
+	}
+	if got := recorder.Header().Get("x-should-retry"); got != "false" {
+		t.Fatalf("x-should-retry = %q, want false", got)
+	}
+	if !strings.Contains(recorder.Body.String(), "(reset after 20s)") {
+		t.Fatalf("body = %s, want reset after 20s", recorder.Body.String())
 	}
 	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Status"); got != "rejected" {
 		t.Fatalf("unified status = %q, want rejected", got)
@@ -317,6 +323,12 @@ func TestWriteClaudeErrorResponse_WeeklyCooldownUsesSevenDayClaim(t *testing.T) 
 	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Representative-Claim"); got != "seven_day" {
 		t.Fatalf("representative claim = %q, want seven_day", got)
 	}
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(recorder.Body.String(), "(reset after 26h)") {
+		t.Fatalf("body = %s, want reset after 26h", recorder.Body.String())
+	}
 }
 
 func TestWriteClaudeErrorResponse_KeepsUpstreamUnifiedReset(t *testing.T) {
@@ -329,7 +341,7 @@ func TestWriteClaudeErrorResponse_KeepsUpstreamUnifiedReset(t *testing.T) {
 		Error:      coreauth.NewModelCooldownError("claude-sonnet-4-6", "claude", 20*time.Second),
 		Addon: http.Header{
 			"Anthropic-Ratelimit-Unified-Status":               {"rejected"},
-			"Anthropic-Ratelimit-Unified-Reset":                {"1794146400"},
+			"Anthropic-Ratelimit-Unified-Reset":                {strconv.FormatInt(time.Now().Add(100*time.Second).Unix(), 10)},
 			"Anthropic-Ratelimit-Unified-Representative-Claim": {"seven_day"},
 			"X-Request-Id": {"req-1"},
 		},
@@ -337,7 +349,13 @@ func TestWriteClaudeErrorResponse_KeepsUpstreamUnifiedReset(t *testing.T) {
 
 	handler.WriteErrorResponse(c, msg)
 
-	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Reset"); got != "1794146400" {
+	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Representative-Claim"); got != "seven_day" {
+		t.Fatalf("representative claim = %q, want seven_day", got)
+	}
+	if !strings.Contains(recorder.Body.String(), "(reset after 1m ") {
+		t.Fatalf("body = %s, want the upstream reset", recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Reset"); got == "20" {
 		t.Fatalf("unified reset = %q, want upstream value", got)
 	}
 	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Representative-Claim"); got != "seven_day" {
